@@ -1,6 +1,7 @@
 import asyncio
 import os
 import shutil
+import json
 from aiohttp import web
 import discord
 from discord import app_commands
@@ -30,9 +31,9 @@ FFMPEG_OPTIONS = {
 # Get the bot's public Render URL dynamically to help the user configure their app
 PUBLIC_BOT_URL = os.getenv("RENDER_EXTERNAL_URL", "https://<your-render-app-name>.onrender.com").rstrip("/")
 
-# In-memory storage for syncing requests and active sessions across multiple users
-pending_requests = {}  # user_id -> list of [{"id": req_id, "query": query}]
-active_sessions = {}   # user_id -> {"vc": VoiceClient, "channel": TextChannel}
+# Active in-memory storage for real-time WebSocket connections and sessions
+active_websockets = {}  # user_id -> WebSocketResponse
+active_sessions = {}    # user_id -> {"vc": VoiceClient, "channel": TextChannel}
 
 
 class MusicBot(commands.Bot):
@@ -49,8 +50,7 @@ class MusicBot(commands.Bot):
         app = web.Application()
         app.router.add_get('/', self.handle_index)
         app.router.add_get('/healthz', self.handle_healthz)
-        app.router.add_get('/api/requests', self.handle_get_requests)
-        app.router.add_post('/api/resolve', self.handle_post_resolve)
+        app.router.add_get('/api/websocket', self.handle_websocket)
 
         runner = web.AppRunner(app)
         await runner.setup()
@@ -65,19 +65,37 @@ class MusicBot(commands.Bot):
     async def handle_healthz(self, request):
         return web.Response(text="OK")
 
-    # API: Android App polls this to fetch new song requests made on Discord
-    async def handle_get_requests(self, request):
+    # Real-Time WebSocket Endpoint
+    async def handle_websocket(self, request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
         user_id = request.query.get("userId")
         if not user_id:
-            return web.json_response([])
-        
-        user_reqs = pending_requests.pop(str(user_id), [])
-        return web.json_response(user_reqs)
+            await ws.close(code=4000, message="Missing userId parameter")
+            return ws
 
-    # API: Android App posts the resolved InnerTune audio stream URL here
-    async def handle_post_resolve(self, request):
-        data = await request.json()
-        user_id = str(data.get("userId"))
+        user_id = str(user_id)
+        active_websockets[user_id] = ws
+        print(f"🔌 WebSocket Connected: User ID {user_id}")
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.TEXT:
+                    data = json.loads(msg.data)
+                    msg_type = data.get("type")
+
+                    if msg_type == "resolve":
+                        await self.process_resolved_track(user_id, data)
+                elif msg.type == web.WSMsgType.ERROR:
+                    print(f"❌ WebSocket connection closed with exception: {ws.exception()}")
+        finally:
+            active_websockets.pop(user_id, None)
+            print(f"🔌 WebSocket Disconnected: User ID {user_id}")
+
+        return ws
+
+    async def process_resolved_track(self, user_id, data):
         stream_url = data.get("stream_url")
         title = data.get("title", "Unknown Track")
         url = data.get("url", "")
@@ -86,27 +104,28 @@ class MusicBot(commands.Bot):
 
         session = active_sessions.get(user_id)
         if not session:
-            return web.json_response({"status": "error", "message": "No active session for this user ID"})
+            print(f"⚠️ No active Discord VC session found for user: {user_id}")
+            return
 
         vc = session["vc"]
         channel = session["channel"]
 
         if not vc or not vc.is_connected():
-            return web.json_response({"status": "error", "message": "Bot is no longer in a Voice Channel"})
+            print(f"⚠️ Bot is no longer connected to a voice channel for user: {user_id}")
+            return
 
         def after_playing(error):
             if error:
                 print(f"❌ Player error: {error}")
 
         try:
-            # Stop any playing audio before playing the new track
             if vc.is_playing() or vc.is_paused():
                 vc.stop()
 
             audio = discord.FFmpegPCMAudio(stream_url, executable=FFMPEG_EXECUTABLE, **FFMPEG_OPTIONS)
             vc.play(audio, after=after_playing)
 
-            # Post beautiful "Now Playing on MusicNest" embed to Discord Voice Text Channel
+            # Post a beautiful Now Playing card back to Discord channel
             embed = discord.Embed(
                 title="🎶 Now Playing on MusicNest",
                 description=f"**[{title}]({url})**",
@@ -114,19 +133,17 @@ class MusicBot(commands.Bot):
             )
             if thumbnail:
                 embed.set_thumbnail(url=thumbnail)
-            embed.set_footer(text="MusicNest Active Bypass Stream")
+            embed.set_footer(text="MusicNest Active Bypass WebSocket Stream")
 
             if duration:
                 m, s = divmod(duration, 60)
                 embed.add_field(name="Duration", value=f"{m:02d}:{s:02d}", inline=True)
 
             self.loop.create_task(channel.send(embed=embed))
-            return web.json_response({"status": "success"})
 
         except Exception as e:
-            print(f"❌ Failed to play resolved stream: {e}")
-            self.loop.create_task(channel.send(f"❌ Failed to stream play resolved track: `{e}`"))
-            return web.json_response({"status": "error", "message": str(e)})
+            print(f"❌ Failed to stream play audio: {e}")
+            self.loop.create_task(channel.send(f"❌ Failed to play audio stream: `{e}`"))
 
 
 bot = MusicBot()
@@ -163,7 +180,7 @@ async def join(interaction: discord.Interaction):
     await interaction.response.send_message(f"🔊 Successfully joined **{channel.name}**! Ready to stream.")
 
 
-@bot.tree.command(name="play", description="Request a song on Discord and bypass it through your MusicNest App")
+@bot.tree.command(name="play", description="Request a song on Discord and play instantly on both app & voice channel")
 @app_commands.describe(query="Song title, artist, or YouTube URL")
 async def play(interaction: discord.Interaction, query: str):
     await interaction.response.defer()
@@ -178,6 +195,15 @@ async def play(interaction: discord.Interaction, query: str):
 
     user_id = str(interaction.user.id)
 
+    # Check if the user's Android app is actively connected to the WebSocket
+    ws = active_websockets.get(user_id)
+    if not ws:
+        return await interaction.followup.send(
+            f"❌ **Your MusicNest Android App is not connected!**\n"
+            f"Please open your MusicNest App, go to Discord settings, and make sure your **Render Server URL** is set to:\n"
+            f"`{PUBLIC_BOT_URL}`"
+        )
+
     # 1. Save active voice connection session for asynchronous callback
     active_sessions[user_id] = {
         "vc": vc,
@@ -185,22 +211,22 @@ async def play(interaction: discord.Interaction, query: str):
         "userId": interaction.user.id
     }
 
-    # 2. Register request in pending requests for this specific user
+    # 2. Push request over WebSocket to Android App in real-time
     req_id = f"req_{int(asyncio.get_event_loop().time() * 1000)}"
-    if user_id not in pending_requests:
-        pending_requests[user_id] = []
-    
-    pending_requests[user_id].append({
-        "id": req_id,
-        "query": query
-    })
+    try:
+        await ws.send_json({
+            "type": "request",
+            "id": req_id,
+            "query": query
+        })
 
-    # 3. Notify the user of bypass sync with exact Render Setup URL
-    await interaction.followup.send(
-        f"📲 Requesting **\"{query}\"** to official MusicNest Android app...\n\n"
-        f"💡 *Tip: If playback does not start, make sure you have entered this bot's URL in your **MusicNest Settings > Render Server URL**:\n"
-        f"`{PUBLIC_BOT_URL}`*"
-    )
+        # 3. Notify the user of WebSocket request
+        await interaction.followup.send(
+            f"📲 Requesting **\"{query}\"** to official MusicNest Android app..."
+        )
+    except Exception as e:
+        print(f"❌ Failed to send request over WebSocket: {e}")
+        await interaction.followup.send("❌ Failed to contact your Android App. Please restart your app.")
 
 
 @bot.tree.command(name="skip", description="Skip the current track")
@@ -220,7 +246,6 @@ async def stop(interaction: discord.Interaction):
         return await interaction.response.send_message("❌ I'm not connected to any Voice Channel!", ephemeral=True)
 
     user_id = str(interaction.user.id)
-    pending_requests.pop(user_id, None)
     active_sessions.pop(user_id, None)
 
     vc.stop()
