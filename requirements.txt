@@ -2,3 +2,4 @@ discord.py[voice]
 yt-dlp
 aiohttp
 PyNaCl
+pytubefix
