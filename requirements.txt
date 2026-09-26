@@ -1,4 +1,4 @@
-asyncio
-discord
-yt_dlp
-pynacl
+discord.py[voice]
+yt-dlp
+aiohttp
+PyNaCl
