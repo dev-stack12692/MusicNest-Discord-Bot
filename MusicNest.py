@@ -27,6 +27,9 @@ FFMPEG_OPTIONS = {
     'options': '-vn',
 }
 
+# Get the bot's public Render URL dynamically to help the user configure their app
+PUBLIC_BOT_URL = os.getenv("RENDER_EXTERNAL_URL", "https://<your-render-app-name>.onrender.com").rstrip("/")
+
 # In-memory storage for syncing requests and active sessions across multiple users
 pending_requests = {}  # user_id -> list of [{"id": req_id, "query": query}]
 active_sessions = {}   # user_id -> {"vc": VoiceClient, "channel": TextChannel}
@@ -192,10 +195,11 @@ async def play(interaction: discord.Interaction, query: str):
         "query": query
     })
 
-    # 3. Notify the user of bypass sync
+    # 3. Notify the user of bypass sync with exact Render Setup URL
     await interaction.followup.send(
-        f"🔎 **Query sent to your MusicNest Android App!**\n"
-        f"Resolving high-quality YouTube Music stream and syncing local player..."
+        f"📲 Requesting **\"{query}\"** to official MusicNest Android app...\n\n"
+        f"💡 *Tip: If playback does not start, make sure you have entered this bot's URL in your **MusicNest Settings > Render Server URL**:\n"
+        f"`{PUBLIC_BOT_URL}`*"
     )
 
 
