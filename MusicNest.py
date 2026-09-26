@@ -1,11 +1,12 @@
 import asyncio
+import os
+from aiohttp import web
 import discord
 from discord import app_commands
 from discord.ext import commands
 import yt_dlp
-import os
 
-# Configure yt_dlp options for ultra-fast, high-quality audio streaming
+# Configure yt_dlp options
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
     'extractaudio': True,
@@ -29,6 +30,7 @@ FFMPEG_OPTIONS = {
 
 ytdl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
 
+
 class YTDLSource(discord.PCMVolumeTransformer):
     def __init__(self, source, *, data, volume=0.5):
         super().__init__(source, volume)
@@ -44,7 +46,6 @@ class YTDLSource(discord.PCMVolumeTransformer):
         data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
         
         if 'entries' in data:
-            # Take first item from a search result
             data = data['entries'][0]
 
         filename = data['url'] if stream else ytdl.prepare_filename(data)
@@ -59,20 +60,35 @@ class MusicBot(commands.Bot):
         self.queue = []
 
     async def setup_hook(self):
-        # Sync slash commands with Discord on launch
         print("Registering slash commands...")
         await self.tree.sync()
+        
+        # Start a lightweight health-check server to satisfy Render's port check
+        app = web.Application()
+        app.router.add_get('/', lambda r: web.Response(text="MusicNest bot is running."))
+        app.router.add_get('/healthz', lambda r: web.Response(text="OK"))
+        
+        runner = web.AppRunner(app)
+        await runner.setup()
+        port = int(os.environ.get("PORT", 8080))
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        print(f"📡 Web server listening on port {port} for Render keep-alive.")
 
 
 bot = MusicBot()
 
+
 @bot.event
 async def on_ready():
     print(f"📡 MusicNest Bot is online as {bot.user}!")
-    await bot.change_presence(activity=discord.Activity(
-        type=discord.ActivityType.listening, 
-        name="MusicNest App"
-    ))
+    await bot.change_presence(
+        activity=discord.Activity(
+            type=discord.ActivityType.listening,
+            name="MusicNest App"
+        )
+    )
+
 
 # --- COMMANDS ---
 
@@ -101,7 +117,6 @@ async def play(interaction: discord.Interaction, query: str):
     if not interaction.user.voice:
         return await interaction.followup.send("❌ You must be in a Voice Channel to request songs!")
 
-    # Check/Join Voice Channel automatically
     vc = interaction.guild.voice_client
     if not vc:
         channel = interaction.user.voice.channel
@@ -117,7 +132,7 @@ async def play(interaction: discord.Interaction, query: str):
             embed = discord.Embed(
                 title="📥 Song Added to Queue",
                 description=f"**[{player.title}]({player.url})** has been added to the playlist.",
-                color=discord.Color.from_rgb(186, 75, 62) # MusicNest Accent Red
+                color=discord.Color.from_rgb(186, 75, 62)
             )
             embed.set_thumbnail(url=player.thumbnail)
             embed.add_field(name="Position in Queue", value=f"#{len(bot.queue)}", inline=True)
@@ -147,7 +162,6 @@ async def play_next(interaction: discord.Interaction, vc):
 
         vc.play(current_player, after=after_playing)
 
-        # Create beautiful Now Playing embed card
         embed = discord.Embed(
             title="🎶 Now Playing on MusicNest",
             description=f"**[{current_player.title}]({current_player.url})**",
@@ -185,7 +199,6 @@ async def stop(interaction: discord.Interaction):
     await interaction.response.send_message("🛑 Stopped playback, cleared queue, and left Voice Channel.")
 
 
-# Run the bot with your Token (loaded from Environment Variables)
 if __name__ == "__main__":
     token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
