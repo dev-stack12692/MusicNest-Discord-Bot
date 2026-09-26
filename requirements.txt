@@ -1,3 +1,4 @@
 asyncio
 discord
 yt_dlp
+pynacl
