@@ -4,3 +4,4 @@ aiohttp
 PyNaCl
 pytubefix
 shuttle
+pyttsx3
